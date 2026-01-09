@@ -1,38 +1,83 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import datetime
 
-# Create FastAPI app
 app = FastAPI()
 
-# Allow connections from any origin (so your Flet frontend can connect)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# List to keep track of connected clients
-clients = []
+clients = {}
+messages = []
 
-# --------- WebSocket endpoint for chat ---------
+AFK_LIMIT = 20 * 60          # 20 minutes
+HISTORY_DAYS = 15
+
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()  # accept connection
-    clients.append(websocket)
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    user = ws.query_params.get("user", "Unknown")
+
+    clients[ws] = {
+        "user": user,
+        "last_active": datetime.datetime.utcnow()
+    }
+
+    join_msg = f"🟢 {user} joined the chat"
+    await broadcast(join_msg)
+
+    # Send message history
+    now = datetime.datetime.utcnow()
+    for msg, ts in messages:
+        if (now - ts).days <= HISTORY_DAYS:
+            await ws.send_text(msg)
+
     try:
         while True:
-            # Receive message from client
-            data = await websocket.receive_text()
-            # Broadcast message to all connected clients
-            for client in clients:
-                await client.send_text(data)
-    except WebSocketDisconnect:
-        # Remove client if disconnected
-        clients.remove(websocket)
+            data = await ws.receive_text()
+            clients[ws]["last_active"] = datetime.datetime.utcnow()
 
-# --------- Optional HTTP route to confirm server is running ---------
+            msg = f"{user}: {data}"
+            messages.append((msg, datetime.datetime.utcnow()))
+            await broadcast(msg)
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        clients.pop(ws, None)
+        leave_msg = f"🔴 {user} left the chat"
+        await broadcast(leave_msg)
+
+async def broadcast(message: str):
+    for ws in list(clients.keys()):
+        try:
+            await ws.send_text(message)
+        except:
+            clients.pop(ws, None)
+
+async def afk_checker():
+    while True:
+        now = datetime.datetime.utcnow()
+        for ws, info in list(clients.items()):
+            if (now - info["last_active"]).seconds > AFK_LIMIT:
+                try:
+                    await ws.send_text("⏰ Disconnected due to inactivity")
+                    await ws.close()
+                except:
+                    pass
+                clients.pop(ws, None)
+        await asyncio.sleep(30)
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(afk_checker())
+
 @app.get("/")
-async def root():
-    return {"message": "FastAPI server is online!"}
+def root():
+    return {"status": "ROBLOXIAN MSG backend running"}
